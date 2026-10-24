@@ -365,6 +365,10 @@ def build_prompt(body, transcript, effect_tools, max_diag, idents):
         "disable_feature are allowed only if the stated conditions hold, otherwise choose page_owner. If the "
         "service is already at its permitted scaling limit (proposed target above the contract maximum, or "
         "freeze is not 0), do NOT scale; choose page_owner. Cite the policy/limit line in the evidence.\n"
+        "- If a line says a runbook is required before paging or changing credentials but is unavailable, do NOT "
+        "choose page_owner: use read_runbook as the diagnostic and open_incident as the effect. If a line says a "
+        "dependency owner must renew something and a linked incident is required, choose open_incident and put "
+        "the dependency identifier in the service argument.\n"
         "- windowMinutes must be an integer from 1 to 60 (use 15 unless the evidence says otherwise).\n"
         "- For rollback_deployment or disable_feature the target must be exactly the deployment/release or "
         "feature flag the evidence implicates; a wrong target is a serious failure.\n"
@@ -514,7 +518,8 @@ def repair_args(args, schema, inc, ctx, cause=""):
         kl, v = k.lower(), out[k]
         spec = props.get(k) if isinstance(props.get(k), dict) else {}
         if kl in ("service", "servicename") and inc.get("service"):
-            out[k] = inc["service"]
+            if not (isinstance(v, str) and v.startswith("dep_") and v in ctx["idents"]):
+                out[k] = inc["service"]
         elif kl == "severity" and inc.get("severity"):
             out[k] = inc["severity"]
         elif kl == "windowminutes":
@@ -981,18 +986,19 @@ def selfcheck(st):
 
 # ---------------------------------------------------------------- response view
 def view(st, new=None):
-    if st["status"] == "waiting":
-        # exactly the shape shown in the spec for a waiting response
-        pending = new if new is not None else json.loads(json.dumps(st["pending"]))
-        approvals = [st["approvalReq"]] if st.get("approvalReq") else []
-        return {"runId": st["runId"], "status": "waiting", "diagnosis": st["diagnosis"],
-                "dispatches": pending, "approvals": approvals}
-    return {
+    pending = new if new is not None else json.loads(json.dumps(st["pending"]))
+    approvals = [st["approvalReq"]] if st.get("approvalReq") else []
+    if st["status"] != "waiting":
+        pending, approvals = [], []
+    out = {
         "runId": st["runId"], "status": st["status"], "diagnosis": st["diagnosis"],
-        "chosenEffect": st["chosenEffect"], "suppressed": st["suppressed"],
-        "dispatches": [], "approvals": [],
+        "suppressed": st["suppressed"],
+        "dispatches": pending, "approvals": approvals,
         "actionLog": st["actionLog"], "receiptLog": st["receiptLog"], "otlp": build_trace(st),
     }
+    if st["status"] != "waiting" or st["chosenEffect"]:
+        out["chosenEffect"] = st["chosenEffect"]
+    return out
 
 
 def dumps(o):
