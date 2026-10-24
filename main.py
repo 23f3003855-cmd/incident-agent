@@ -623,7 +623,8 @@ def normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_dia
     e = raw.get("effect") if isinstance(raw.get("effect"), dict) else {}
     etn = e.get("toolName")
     if etn not in effect_tools and effect_tools:
-        etn = effect_tools[0]
+        etn = next((n for n in ("page_owner", "open_incident", "no_action") if n in effect_tools), None) \
+            or next((n for n in effect_tools if n not in REVERSAL_TOOLS), effect_tools[0])
     if etn:
         effect = {"toolName": etn,
                   "arguments": repair_args(e.get("arguments"), schemas.get(etn), inc, ctx, cause),
@@ -656,6 +657,13 @@ def normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_dia
             elif ri:
                 add_ev(ri[0])
 
+    # never emit a destructive effect unless its target (release / flag) literally appears in the transcript
+    if effect and effect["toolName"] in REVERSAL_TOOLS and "page_owner" in effect_tools:
+        tkey = "release" if effect["toolName"] == "rollback_deployment" else "flag"
+        tval = effect["arguments"].get(tkey)
+        if not (isinstance(tval, str) and grounded(tval, ctx)):
+            log("destructive target ungrounded -> page_owner")
+            effect = {"toolName": "page_owner", "arguments": page_args(), "evidence": ev[:1]}
     for d in diags:
         d["evidence"] = [i for i in d["evidence"] if i in ev] or ev[:1]
     if effect:
