@@ -20,6 +20,7 @@ import collections
 import hashlib
 import json
 import os
+import queue
 import re
 import sqlite3
 import threading
@@ -38,12 +39,9 @@ PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "13.5"))  # grader allows 18s 
 
 
 def configured_models():
-    preferred = os.environ.get("GEMINI_PRIMARY_MODEL", "gemini-3.1-flash-lite").strip()
-    configured = [m.strip() for m in os.environ.get(
-        "GEMINI_MODELS",
-        "gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-3-flash-preview").split(",") if m.strip()]
-    candidates = [preferred, "gemini-3.5-flash-lite", "gemini-3.6-flash",
-                  "gemini-3-flash-preview"] + configured
+    preferred = os.environ.get("GEMINI_PRIMARY_MODEL", "gemini-3-flash-preview").strip()
+    configured = [m.strip() for m in os.environ.get("GEMINI_MODELS", "").split(",") if m.strip()]
+    candidates = [preferred, "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.6-flash"] + configured
     seen, result = set(), []
     for name in candidates:
         if name and name not in seen:
@@ -54,6 +52,7 @@ def configured_models():
 
 MODELS = configured_models()
 _events = collections.deque(maxlen=300)
+_last = collections.deque(maxlen=12)
 
 
 def log(*a):
@@ -232,11 +231,15 @@ def build_prompt(body, transcript, effect_tools, max_diag):
         ' "diagnostics": [{"toolName": "..", "arguments": {..}, "evidence": ["ev_.."]}],\n'
         ' "effect": {"toolName": "..", "arguments": {..}, "evidence": ["ev_.."]}}\n\n'
         "Rules:\n"
-        "- diagnostics: 1 to %d calls, only tools that are NOT effect tools %s, only calls strictly needed to "
-        "confirm the root cause. Independent calls are sent together. No duplicates.\n"
+        "- Read every tool description in the catalog; it says what the tool confirms. Pick the diagnostic "
+        "tools (1 to %d, NOT effect tools %s) that directly confirm THIS root cause. Use 2 or 3 independent "
+        "diagnostics when different signals are needed (for example a metric plus a log, deploy or config "
+        "check); use 1 only if one call truly settles it. Do not pick tools unrelated to the root cause and do "
+        "not repeat a tool with the same arguments. Follow any runbook or hint lines in the transcript.\n"
         "- arguments must follow each tool's inputSchema and use exact values (service, deployment, region, "
-        "feature flag, time window, IDs) taken from this incident's transcript. Never invent values.\n"
-        "- every diagnostic's evidence must be a subset of the top-level evidence list.\n"
+        "feature flag, time window, IDs) copied from this incident's transcript. Never invent values.\n"
+        "- top-level evidence: the 2 to 4 lines that directly state or prove the cause, not generic noise. "
+        "Every diagnostic's evidence must be a subset of that list.\n"
         "- effect: exactly one tool from %s that fits the root cause and the evidence.\n"
         "- If the service is already at its permitted scaling limit (max replicas / quota reached), do NOT "
         "scale; choose the tool that pages the owner instead.\n"
@@ -285,25 +288,56 @@ def heuristic_plan(body, transcript, ev_ids, effect_tools, catalog, max_diag):
 
 
 def run_planner(body, transcript, ev_ids, effect_tools, catalog, max_diag):
-    """Returns (raw_plan, model_name_used). One logical planning step."""
+    """Returns (raw_plan, model_name_used, source). Races models: a new model is started when the
+    current one fails or is slow (HEDGE seconds); the first valid answer wins."""
     prompt = build_prompt(body, transcript, effect_tools, max_diag)
     deadline = time.time() + PLAN_BUDGET
-    last_model = MODELS[0]
-    for m in MODELS:
-        remaining = deadline - time.time()
-        if remaining < 3:
-            break
-        last_model = m
+    hedge = float(os.environ.get("PLAN_HEDGE", "5"))
+    models = MODELS[:4]
+    results = queue.Queue()
+
+    def worker(m, timeout):
         try:
-            raw = gemini_call(m, prompt, min(remaining, 12.0))
-            if isinstance(raw, dict) and raw.get("rootCause"):
-                log("planner ok model=%s" % m)
-                return raw, m
-            log("planner bad shape model=%s" % m)
+            results.put((m, gemini_call(m, prompt, timeout), None))
         except Exception as e:
-            log("planner fail model=%s err=%s" % (m, str(e)[:80]))
+            results.put((m, None, str(e)[:80]))
+
+    state = {"started": 0, "pending": 0}
+
+    def start_next():
+        remaining = deadline - time.time()
+        if state["started"] >= len(models) or remaining < 2.5:
+            return False
+        m = models[state["started"]]
+        state["started"] += 1
+        state["pending"] += 1
+        threading.Thread(target=worker, args=(m, remaining), daemon=True).start()
+        return True
+
+    start_next()
+    next_hedge = time.time() + hedge
+    while True:
+        now = time.time()
+        if now >= deadline:
+            break
+        try:
+            m, raw, err = results.get(timeout=max(0.05, min(next_hedge, deadline) - now))
+        except queue.Empty:
+            if time.time() >= next_hedge:
+                start_next()
+                next_hedge = time.time() + hedge
+            continue
+        state["pending"] -= 1
+        if isinstance(raw, dict) and raw.get("rootCause"):
+            log("planner ok model=%s" % m)
+            return raw, m, "model"
+        log("planner fail model=%s err=%s" % (m, err or "bad shape"))
+        if not start_next() and state["pending"] <= 0:
+            break
+        next_hedge = time.time() + hedge
     log("planner fallback heuristic")
-    return heuristic_plan(body, transcript, ev_ids, effect_tools, catalog, max_diag), last_model
+    used = models[max(0, state["started"] - 1)] if models else "gemini"
+    return heuristic_plan(body, transcript, ev_ids, effect_tools, catalog, max_diag), used, "fallback"
 
 
 def clean_args(args, schema):
@@ -712,14 +746,31 @@ def validate_create(body):
 def validate_fields(body):
     inc = body.get("incident")
     policy = body.get("policy")
-    if (not nes(body.get("runId"), 256) or not nes(body.get("agentName"), 256)
-            or not nes(body.get("publicMarker"), 512)
-            or not isinstance(inc, dict) or not isinstance(inc.get("allowedRootCauses"), list)
-            or not inc["allowedRootCauses"] or not transcript_text(inc).strip()
-            or not isinstance(body.get("toolCatalog"), list) or not isinstance(policy, dict)
-            or not isinstance(policy.get("effectTools", []), list)
-            or not isinstance(policy.get("approvalRequiredFor", []), list)):
-        raise HttpError(422, "invalid incident request")
+    problems = []
+    for k, mx in (("runId", 256), ("agentName", 256), ("publicMarker", 512)):
+        if not nes(body.get(k), mx):
+            problems.append(k)
+    if not isinstance(inc, dict):
+        problems.append("incident")
+    else:
+        if not isinstance(inc.get("allowedRootCauses"), list) or not inc.get("allowedRootCauses"):
+            problems.append("incident.allowedRootCauses")
+        if not transcript_text(inc).strip():
+            problems.append("incident.transcript")
+    if not isinstance(body.get("toolCatalog"), list):
+        problems.append("toolCatalog")
+    if not isinstance(policy, dict):
+        problems.append("policy")
+    else:
+        for k in ("effectTools", "approvalRequiredFor"):
+            if k in policy and not isinstance(policy[k], list):
+                problems.append("policy." + k)
+    if problems:
+        log("422 create invalid fields=%s keys=%s inc=%s pol=%s" % (
+            ",".join(problems), sorted(body.keys()),
+            sorted(inc.keys()) if isinstance(inc, dict) else None,
+            sorted(policy.keys()) if isinstance(policy, dict) else None))
+        raise HttpError(422, "invalid incident request: " + ",".join(problems))
 
 
 def create_run(body, hdrs):
@@ -753,9 +804,21 @@ def create_run(body, hdrs):
         collect_strings(body.get("sensitive"), secrets)
         secrets = sorted(set(secrets), key=len, reverse=True)
         t_plan0 = now_ns()
-        raw, model = run_planner(body, transcript, ev_ids, effect_tools, catalog, max_diag)
+        raw, model, source = run_planner(body, transcript, ev_ids, effect_tools, catalog, max_diag)
         t_plan1 = now_ns()
         plan = normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_diag, secrets)
+        log("plan run=%s model=%s ev_ids_parsed=%d cause_ok=%s evidence=%s diags=%s effect=%s approval_req=%s "
+            "incoming_tp=%s" % (rid, model, len(ev_ids), plan["diagnosis"]["rootCause"] in inc["allowedRootCauses"],
+                                plan["diagnosis"]["evidence"],
+                                [d["toolName"] for d in plan["diagnostics"]],
+                                plan["effect"]["toolName"] if plan["effect"] else None,
+                                plan["effect"]["toolName"] in policy.get("approvalRequiredFor", []) if plan["effect"] else None,
+                                bool(parse_tp(hdrs.get("traceparent")) or parse_tp(body.get("traceparent")))))
+        _last.append(scrub({"runId": rid, "source": source, "model": model, "plan_sec": round((t_plan1 - t_plan0) / 1e9, 2),
+                            "incident": {k: inc.get(k) for k in ("incidentId", "title", "service", "severity")},
+                            "allowedRootCauses": inc.get("allowedRootCauses"), "toolCatalog": catalog,
+                            "policy": {k: policy.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
+                            "rawModelPlan": raw, "finalPlan": plan, "transcriptChars": len(transcript)}, secrets))
         st, new = init_state(body, plan, model, hdrs, t_start, t_plan0, t_plan1)
         db_save(rid, sha(body), st)
         log("run created", rid[:12], "diag=%d" % len(st["diagIds"]), "approval=%s" % st["needsApproval"])
@@ -842,6 +905,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, dumps({"ok": True, "profile": PROFILE}))
             if p == "/_log":
                 return self._send(200, "\n".join(_events), "text/plain; charset=utf-8")
+            if p == "/_last":
+                return self._send(200, dumps(list(_last)))
             if p == "/_test":
                 return self._send(200, dumps(self_test()))
             m = re.match(r"^/v2/incidents/([^/]+)$", p)
@@ -850,6 +915,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_run(unquote(m.group(1))))
             self._err(404, "not found")
         except HttpError as e:
+            log("reject", self.command, self._path()[:60], e.code, e.msg[:80])
             self._err(e.code, e.msg)
         except Exception as e:
             log("GET error", type(e).__name__)
@@ -870,6 +936,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, handle_receipt(unquote(m.group(1)), body))
             self._err(404, "not found")
         except HttpError as e:
+            log("reject", self.command, self._path()[:60], e.code, e.msg[:80])
             self._err(e.code, e.msg)
         except Exception as e:
             log("POST error", type(e).__name__)
