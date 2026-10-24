@@ -218,6 +218,27 @@ def evidence_ids(transcript):
     return out
 
 
+LINE_RE = re.compile(r"^\s*\[([^\]\s]+)\]\s+(\S+)\s+([^:\n]{3,40}):\s*(.*)$")
+
+
+def parse_lines(transcript):
+    out = []
+    for line in transcript.splitlines():
+        m = LINE_RE.match(line)
+        if m:
+            out.append({"id": m.group(1), "ts": m.group(2), "kind": m.group(3),
+                        "body": m.group(4).strip(), "raw": line.strip()})
+    return out
+
+
+def signal_lines(transcript):
+    """Boilerplate repeats verbatim under many IDs; the real evidence lines are unique."""
+    lines = parse_lines(transcript)
+    cnt = collections.Counter(l["body"] for l in lines)
+    sig = [l for l in lines if cnt[l["body"]] < 3]
+    return sig if 2 <= len(sig) <= 30 else []
+
+
 def build_prompt(body, transcript, effect_tools, max_diag):
     inc, policy = body["incident"], body.get("policy") or {}
     safe_policy = {k: policy.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}
@@ -239,9 +260,15 @@ def build_prompt(body, transcript, effect_tools, max_diag):
         "not repeat a tool with the same arguments. Follow any runbook or hint lines in the transcript.\n"
         "- arguments must follow each tool's inputSchema and use exact values (service, deployment, region, "
         "feature flag, time window, IDs) copied from this incident's transcript. Never invent values.\n"
-        "- top-level evidence: the 2 to 4 lines that directly state or prove the cause, not generic noise. "
+        "- top-level evidence: the 2 to 4 lines that state the cause, confirm it, or give the policy/limit that decides the effect. "
         "Every diagnostic's evidence must be a subset of that list.\n"
         "- effect: exactly one tool from %s that fits the root cause and the evidence.\n"
+        "- The lines below are the candidate evidence (verbatim-repeated boilerplate was removed). Some lines "
+        "state operating policy or limits (delegation, freeze, remaining permitted changes, replica ceiling). "
+        "Apply them literally: a reversal tool (rollback_deployment, disable_feature) is allowed only if the "
+        "stated conditions hold, otherwise choose page_owner. Cite the policy/limit line in the evidence.\n"
+        "- windowMinutes must be an integer from 1 to 60 (use 15 unless the evidence says otherwise). "
+        "Use identifiers (flag, release, dependency, metric, log query terms) exactly as written in the evidence.\n"
         "- If the service is already at its permitted scaling limit (max replicas / quota reached), do NOT "
         "scale; choose the tool that pages the owner instead.\n"
         "- For rollback_deployment or disable_feature, the target must be exactly the deployment or feature "
@@ -350,7 +377,7 @@ def clean_args(args, schema):
     return dict(args)
 
 
-def normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_diag, secrets):
+def normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_diag, secrets, sig=None):
     inc = body["incident"]
     allowed = inc["allowedRootCauses"]
     ev_set = set(ev_ids)
@@ -384,6 +411,19 @@ def normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_dia
         if i not in ev:
             ev.append(i)
 
+    sig = sig or []
+    sig_ids = [l["id"] for l in sig]
+    if sig_ids:
+        if 2 <= len(sig_ids) <= 4:
+            ev = list(sig_ids)
+        else:
+            pol = [l["id"] for l in sig if re.search(r"polic|ceiling|limit", l["body"], re.I)]
+            merged = []
+            for i in pol + [i for i in ev if i in sig_ids] + sig_ids:
+                if i not in merged:
+                    merged.append(i)
+            ev = merged[:4]
+
     diags, seen = [], set()
     names = {t.get("name") for t in catalog if isinstance(t, dict)}
     for d in (raw.get("diagnostics") or []):
@@ -415,6 +455,22 @@ def normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_dia
         effect = {"toolName": etn, "arguments": clean_args(e.get("arguments"), schemas.get(etn)),
                   "evidence": [i for i in good_ids(e.get("evidence")) if i in ev] or ev[:1]}
 
+    if effect and effect["toolName"] in ("rollback_deployment", "disable_feature") and "page_owner" in effect_tools:
+        for l in sig:
+            m = re.search(r"delegation\s*=\s*(\d+)\D+freeze\s*=\s*(\d+)\D+remaining[^=]*=\s*(-?\d+)", l["body"], re.I)
+            if m and not (int(m.group(1)) == 1 and int(m.group(2)) == 0 and int(m.group(3)) > 0):
+                effect = {"toolName": "page_owner",
+                          "arguments": {"service": inc.get("service", ""), "severity": inc.get("severity", "SEV-1")},
+                          "evidence": ev[:]}
+                break
+    for d in diags + ([effect] if effect else []):
+        w = d["arguments"].get("windowMinutes")
+        if "windowMinutes" in d["arguments"]:
+            try:
+                wi = int(w)
+                d["arguments"]["windowMinutes"] = wi if 1 <= wi <= 60 else (60 if wi > 60 else 15)
+            except Exception:
+                d["arguments"]["windowMinutes"] = 15
     plan = {"diagnosis": {"rootCause": cause, "evidence": ev}, "diagnostics": diags, "effect": effect}
     return scrub(plan, secrets)
 
@@ -829,10 +885,16 @@ def create_run(body, hdrs):
         secrets = []
         collect_strings(body.get("sensitive"), secrets)
         secrets = sorted(set(secrets), key=len, reverse=True)
+        sig = signal_lines(transcript)
+        ptext = transcript
+        if sig:
+            ptext = "(%d lines that repeat verbatim were removed as boilerplate)\n%s" % (
+                len(parse_lines(transcript)) - len(sig), "\n".join(l["raw"] for l in sig))
+        log("signal lines=%d of %d" % (len(sig), len(parse_lines(transcript))))
         t_plan0 = now_ns()
-        raw, model, source = run_planner(body, transcript, ev_ids, effect_tools, catalog, max_diag)
+        raw, model, source = run_planner(body, ptext, ev_ids, effect_tools, catalog, max_diag)
         t_plan1 = now_ns()
-        plan = normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_diag, secrets)
+        plan = normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_diag, secrets, sig)
         log("plan run=%s model=%s ev_ids_parsed=%d cause_ok=%s evidence=%s diags=%s effect=%s approval_req=%s "
             "incoming_tp=%s" % (rid, model, len(ev_ids), plan["diagnosis"]["rootCause"] in inc["allowedRootCauses"],
                                 plan["diagnosis"]["evidence"],
