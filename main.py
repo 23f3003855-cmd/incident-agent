@@ -218,24 +218,30 @@ def evidence_ids(transcript):
     return out
 
 
-LINE_RE = re.compile(r"^\s*\[([^\]\s]+)\]\s+(\S+)\s+([^:\n]{3,40}):\s*(.*)$")
+LINE_RE = re.compile(r"^\s*\[(ev_[^\]\s]+)\]\s*(.*)$")
+TS_RE = re.compile(r"^(?:\d{4}-\d\d-\d\d[T ])?\d\d:\d\d(?::\d\d)?(?:\.\d+)?Z?\s*")
+LABEL_RE = re.compile(r"^([A-Za-z][A-Za-z \-]{2,38}):\s+(.*)$")
 
 
 def parse_lines(transcript):
     out = []
     for line in transcript.splitlines():
         m = LINE_RE.match(line)
-        if m:
-            out.append({"id": m.group(1), "ts": m.group(2), "kind": m.group(3),
-                        "body": m.group(4).strip(), "raw": line.strip()})
+        if not m:
+            continue
+        rest = TS_RE.sub("", m.group(2).strip())
+        lm = LABEL_RE.match(rest)
+        body = (lm.group(2) if lm else rest).strip()
+        out.append({"id": m.group(1), "body": body, "raw": line.strip()})
     return out
 
 
 def signal_lines(transcript):
     """Boilerplate repeats verbatim under many IDs; the real evidence lines are unique."""
     lines = parse_lines(transcript)
-    cnt = collections.Counter(l["body"] for l in lines)
-    sig = [l for l in lines if cnt[l["body"]] < 3]
+    key = lambda l: re.sub(r"\d+", "#", l["body"])
+    cnt = collections.Counter(key(l) for l in lines)
+    sig = [l for l in lines if cnt[key(l)] < 3]
     return sig if 2 <= len(sig) <= 30 else []
 
 
@@ -279,7 +285,34 @@ def build_prompt(body, transcript, effect_tools, max_diag):
     )
 
 
+def fill_args(tool, inc, cause=""):
+    req = ((tool.get("inputSchema") or {}).get("required")) or []
+    out = {}
+    for k in req:
+        kl = k.lower()
+        if kl in ("service", "servicename"):
+            out[k] = inc.get("service", "")
+        elif kl == "severity":
+            out[k] = inc.get("severity", "SEV-1")
+        elif kl == "windowminutes":
+            out[k] = 15
+        elif kl == "query":
+            out[k] = str(cause).replace("_", " ")
+        elif kl == "topic":
+            out[k] = str(cause)
+        elif kl == "metric":
+            out[k] = "error_rate"
+        elif kl == "reasoncode":
+            out[k] = "insufficient_evidence"
+        elif kl == "targetreplicas":
+            out[k] = 1
+        else:
+            out[k] = inc.get(k, "")
+    return out
+
+
 def heuristic_plan(body, transcript, ev_ids, effect_tools, catalog, max_diag):
+    """Last-resort planner. Never picks a destructive effect and never emits empty arguments."""
     inc = body["incident"]
     low = transcript.lower()
     best, score = inc["allowedRootCauses"][0], -1.0
@@ -294,24 +327,23 @@ def heuristic_plan(body, transcript, ev_ids, effect_tools, catalog, max_diag):
         m = EV_ANY_RE.match(line)
         if m and any(t in line.lower() for t in toks) and m.group(1) not in ev:
             ev.append(m.group(1))
-    diags, effect = [], None
-    for t in catalog:
-        name = t.get("name") if isinstance(t, dict) else None
-        if not name:
-            continue
-        args = {}
-        props = ((t.get("inputSchema") or {}).get("properties")) or {}
-        for pk, pv in props.items():
-            if isinstance(pv, dict) and pv.get("enum"):
-                args[pk] = pv["enum"][0]
-            elif pk.lower() in ("service", "servicename"):
-                args[pk] = inc.get("service", "")
-            elif pk.lower() == "incidentid":
-                args[pk] = inc.get("incidentId", "")
-        if name in effect_tools:
-            effect = effect or {"toolName": name, "arguments": args}
-        elif len(diags) < max_diag and not diags:
-            diags.append({"toolName": name, "arguments": args})
+    by_name = {t.get("name"): t for t in catalog if isinstance(t, dict) and t.get("name")}
+    c = str(best).lower()
+    pref = [("deploy", "inspect_deployment"), ("certificate", "dependency_status"),
+            ("dependency", "dependency_status"), ("database", "query_metrics"),
+            ("traffic", "query_metrics"), ("capacity", "query_metrics"),
+            ("flag", "query_logs"), ("secret", "read_runbook")]
+    dtool = next((n for k, n in pref if k in c and n in by_name), None)
+    if not dtool:
+        dtool = next((n for n in by_name if n not in effect_tools), None)
+    diags = [{"toolName": dtool, "arguments": fill_args(by_name[dtool], inc, best)}] if dtool else []
+    safe = [n for n in ("page_owner", "open_incident", "no_action") if n in effect_tools] or \
+           [n for n in effect_tools if n not in ("rollback_deployment", "disable_feature")]
+    effect = None
+    if safe:
+        t = by_name.get(safe[0])
+        effect = {"toolName": safe[0],
+                  "arguments": fill_args(t, inc, best) if t else {"service": inc.get("service", "")}}
     return {"rootCause": best, "evidence": ev, "diagnostics": diags, "effect": effect}
 
 
@@ -320,8 +352,8 @@ def run_planner(body, transcript, ev_ids, effect_tools, catalog, max_diag):
     current one fails or is slow (HEDGE seconds); the first valid answer wins."""
     prompt = build_prompt(body, transcript, effect_tools, max_diag)
     deadline = time.time() + PLAN_BUDGET
-    hedge = float(os.environ.get("PLAN_HEDGE", "5"))
-    models = MODELS[:4]
+    hedge = float(os.environ.get("PLAN_HEDGE", "4"))
+    models = [MODELS[0], MODELS[1 % len(MODELS)], MODELS[0], MODELS[1 % len(MODELS)]] + MODELS[2:3]
     results = queue.Queue()
 
     def worker(m, timeout):
@@ -805,12 +837,15 @@ def view(st, new=None):
     approvals = [st["approvalReq"]] if st.get("approvalReq") else []
     if st["status"] != "waiting":
         pending, approvals = [], []
-    return {
+    out = {
         "runId": st["runId"], "status": st["status"], "diagnosis": st["diagnosis"],
-        "chosenEffect": st["chosenEffect"], "suppressed": st["suppressed"],
+        "suppressed": st["suppressed"],
         "dispatches": pending, "approvals": approvals,
         "actionLog": st["actionLog"], "receiptLog": st["receiptLog"], "otlp": build_trace(st),
     }
+    if st["status"] != "waiting" or st["chosenEffect"]:
+        out["chosenEffect"] = st["chosenEffect"]
+    return out
 
 
 def dumps(o):
@@ -906,7 +941,8 @@ def create_run(body, hdrs):
                             "incident": {k: inc.get(k) for k in ("incidentId", "title", "service", "severity")},
                             "allowedRootCauses": inc.get("allowedRootCauses"), "toolCatalog": catalog,
                             "policy": {k: policy.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
-                            "rawModelPlan": raw, "finalPlan": plan, "transcriptChars": len(transcript)}, secrets))
+                            "rawModelPlan": raw, "finalPlan": plan, "transcriptChars": len(transcript),
+                            "signalLines": [l["raw"][:400] for l in sig]}, secrets))
         st, new = init_state(body, plan, model, hdrs, t_start, t_plan0, t_plan1)
         selfcheck(st)
         _transcripts.append({"runId": rid, "chars": len(transcript), "text": scrub(transcript, secrets)})
