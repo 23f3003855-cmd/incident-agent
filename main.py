@@ -39,9 +39,9 @@ PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "13.5"))  # grader allows 18s 
 
 
 def configured_models():
-    preferred = os.environ.get("GEMINI_PRIMARY_MODEL", "gemini-3-flash-preview").strip()
+    preferred = os.environ.get("GEMINI_PRIMARY_MODEL", "gemini-3.1-flash-lite").strip()
     configured = [m.strip() for m in os.environ.get("GEMINI_MODELS", "").split(",") if m.strip()]
-    candidates = [preferred, "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.6-flash"] + configured
+    candidates = [preferred, "gemini-3.5-flash-lite", "gemini-3-flash-preview", "gemini-3.6-flash"] + configured
     seen, result = set(), []
     for name in candidates:
         if name and name not in seen:
@@ -53,6 +53,7 @@ def configured_models():
 MODELS = configured_models()
 _events = collections.deque(maxlen=300)
 _last = collections.deque(maxlen=12)
+_transcripts = collections.deque(maxlen=10)
 
 
 def log(*a):
@@ -717,6 +718,31 @@ def build_trace(st):
         "scopeSpans": [{"scope": {"name": "ga5.incident.agent"}, "spans": spans}]}]}
 
 
+def selfcheck(st):
+    probs = []
+    ev = st["diagnosis"]["evidence"]
+    if not 2 <= len(ev) <= 4 or len(set(ev)) != len(ev):
+        probs.append("diagnosis_evidence_count")
+    if not 1 <= len(st["diagIds"]) <= 3:
+        probs.append("diag_count")
+    seen_a, seen_c = set(), set()
+    for d in st["actionLog"]:
+        if len(d["actionId"]) < 8 or len(d["callId"]) < 8:
+            probs.append("id_short")
+        if d["actionId"] in seen_a and d["attempt"] == 1:
+            probs.append("dup_action")
+        if d["callId"] in seen_c and d["attempt"] == 1:
+            probs.append("dup_call")
+        seen_a.add(d["actionId"]); seen_c.add(d["callId"])
+        if not parse_tp(d["traceparent"]):
+            probs.append("traceparent")
+        if not d["evidence"] or not set(d["evidence"]) <= set(ev) or len(set(d["evidence"])) != len(d["evidence"]):
+            probs.append("dispatch_evidence")
+        if not isinstance(d["arguments"], dict) or not d["arguments"]:
+            probs.append("empty_arguments")
+    log("selfcheck", ",".join(sorted(set(probs))) or "ok")
+
+
 # ---------------------------------------------------------------- response view
 def view(st, new=None):
     pending = new if new is not None else json.loads(json.dumps(st["pending"]))
@@ -820,6 +846,8 @@ def create_run(body, hdrs):
                             "policy": {k: policy.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
                             "rawModelPlan": raw, "finalPlan": plan, "transcriptChars": len(transcript)}, secrets))
         st, new = init_state(body, plan, model, hdrs, t_start, t_plan0, t_plan1)
+        selfcheck(st)
+        _transcripts.append({"runId": rid, "chars": len(transcript), "text": scrub(transcript, secrets)})
         db_save(rid, sha(body), st)
         log("run created", rid[:12], "diag=%d" % len(st["diagIds"]), "approval=%s" % st["needsApproval"])
         return dumps(view(st, new))
@@ -905,6 +933,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, dumps({"ok": True, "profile": PROFILE}))
             if p == "/_log":
                 return self._send(200, "\n".join(_events), "text/plain; charset=utf-8")
+            if p == "/_transcript":
+                q = self.path.split("?", 1)[1] if "?" in self.path else ""
+                m2 = re.search(r"(?:^|&)i=(\d+)", q)
+                if not m2:
+                    return self._send(200, dumps([{"i": i, "runId": t["runId"], "chars": t["chars"]}
+                                                  for i, t in enumerate(_transcripts)]))
+                i = int(m2.group(1))
+                if i >= len(_transcripts):
+                    raise HttpError(404, "no such transcript")
+                return self._send(200, _transcripts[i]["text"], "text/plain; charset=utf-8")
             if p == "/_last":
                 return self._send(200, dumps(list(_last)))
             if p == "/_test":
