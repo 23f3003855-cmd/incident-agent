@@ -20,6 +20,7 @@ if DB_PATH != ":memory:":
 MAX_BODY = 6 * 1024 * 1024
 PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "13.5"))  # grader allows 18s per request
 REVERSAL_TOOLS = ("rollback_deployment", "disable_feature")
+MINIMAL_WAITING = os.environ.get("MINIMAL_WAITING", "1") == "1"
 
 
 def configured_models():
@@ -1200,6 +1201,10 @@ def view(st, new=None):
     approvals = [st["approvalReq"]] if st.get("approvalReq") else []
     if st["status"] != "waiting":
         pending, approvals = [], []
+    if st["status"] == "waiting" and MINIMAL_WAITING:
+        # exactly the fields the contract shows for a waiting response
+        return {"runId": st["runId"], "status": "waiting", "diagnosis": st["diagnosis"],
+                "dispatches": pending, "approvals": approvals}
     out = {
         "runId": st["runId"], "status": st["status"], "diagnosis": st["diagnosis"],
         "suppressed": st["suppressed"],
