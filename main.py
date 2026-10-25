@@ -196,6 +196,62 @@ def parse_lines(transcript):
     return out
 
 
+KEYNUM_RE = re.compile(r"[A-Za-z0-9_\-]*\d[A-Za-z0-9_\-]*")
+KEYID_RE = re.compile(r"\b[a-z]{2,6}_[A-Za-z0-9]{5,}\b")
+
+
+def signal_lines(lines):
+    """Boilerplate repeats under many IDs (same text, different numbers/ids); decisive evidence is rare.
+    Used ONLY as a sanity check on the model's root cause, never to hide lines from the model."""
+    if not lines:
+        return []
+
+    def key(l):
+        k = KEYNUM_RE.sub("#", l["body"])
+        k = KEYID_RE.sub("#", k)
+        return k.lower()
+
+    cnt = collections.Counter(key(l) for l in lines)
+    sig = [l for l in lines if cnt[key(l)] < 3]
+    if len(sig) > 30:
+        sig = [l for l in lines if cnt[key(l)] == 1]
+    if len(sig) > 30 or len(sig) < 2:
+        return []
+    return sig
+
+
+CAUSE_SIGNS = {
+    "deployment_regression": ["rollout", "release", "holdback", "previous release", "regress"],
+    "database_connection_exhaustion": ["connection ceiling", "pool checkout", "pool acquisition", "checkout wait",
+                                       "connection pool", "database reached", "pool timeouts", "connection limit",
+                                       "database saturation"],
+    "dependency_certificate_expired": ["certificate", "notafter", "leaf certificate", "expired", "dep_"],
+    "feature_flag_recursion": ["flag_", "recursive", "recursion", "evaluation path", "depth guard", "flag rule",
+                               "cohort"],
+    "traffic_capacity_exhaustion": ["queue depth", "requests per second", "per-replica utilization",
+                                    "utilization is pinned", "latency rise", "extra replica", "capacity ceiling",
+                                    "shard of the queue"],
+    "secret_rotation_mismatch": ["secret version", "vault", "revoked", "credential", "rotation",
+                                 "promoted version", "revocation"],
+}
+
+
+def crosscheck_cause(cause, sig, allowed):
+    """If the decisive (non-boilerplate) lines clearly point at a different allowed cause, switch to it."""
+    if not sig:
+        return cause
+    text = " ".join(l["body"] for l in sig).lower()
+    scores = {c: sum(text.count(p) for p in CAUSE_SIGNS.get(c, [])) for c in allowed}
+    if not scores:
+        return cause
+    best = max(scores, key=lambda c: scores[c])
+    mine = scores.get(cause, 0)
+    if best != cause and scores[best] >= 3 and scores[best] >= mine + 2:
+        log("cause crosscheck: %s(%d) -> %s(%d)" % (cause, mine, best, scores[best]))
+        return best
+    return cause
+
+
 def norm_text(s):
     return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
 
@@ -334,6 +390,7 @@ def build_prompt(body, transcript, effect_tools, max_diag, idents, correction=""
         "7. Choose exactly one effect from %s, but do not execute it now. It will be dispatched only after diagnostics succeed. Use exact target arguments from evidence.\n"
         "8. Destructive effects rollback_deployment and disable_feature are allowed only when policy evidence permits them and their target identifier is explicit. Otherwise page_owner when available.\n"
         "9. Scaling rule is strict: if the proposed target is ABOVE the contract maximum OR freeze is nonzero, do not scale; choose page_owner. If scaling is permitted for a capacity incident, choose scale_service with the exact proposed target.\n"
+        "9b. Telling similar causes apart: database_connection_exhaustion = pool checkout/acquisition waits or timeouts and the database at its connection ceiling while request volume and CPU are ordinary. traffic_capacity_exhaustion = queue depth and latency rising with requests per second while per-replica utilization is pinned. Pick by those decisive lines, not by the recovery action.\n"
         "10. If a required runbook must be read before paging/credential changes and is unavailable, diagnose with read_runbook and choose open_incident. If a dependency owner must renew something and a linked incident is required, choose open_incident with the dependency identifier required by the schema.\n"
         % (canon({k: inc.get(k) for k in ("incidentId", "title", "service", "severity")}),
            canon(inc.get("allowedRootCauses")), canon(body.get("toolCatalog")), canon(safe_policy),
@@ -684,6 +741,7 @@ def normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_dia
     cause = raw.get("rootCause") if isinstance(raw, dict) else None
     if cause not in allowed:
         cause = allowed[0]
+    cause = crosscheck_cause(cause, sig, allowed)
 
     def good_ids(lst):
         out = []
@@ -1185,7 +1243,8 @@ def create_run(body, hdrs):
         raw, model, source = run_planner(body, transcript, ev_ids, effect_tools, catalog, max_diag,
                                          ctx["idents"][:60])
         t_plan1 = now_ns()
-        plan = normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_diag, secrets, [], ctx)
+        sig = signal_lines(lines)
+        plan = normalize_plan(raw, body, transcript, ev_ids, effect_tools, catalog, max_diag, secrets, sig, ctx)
         _last.append(scrub({"runId": rid, "model": model, "source": source,
                             "incident": {k: inc.get(k) for k in ("incidentId", "title", "service", "severity",
                                                                  "allowedRootCauses")},
